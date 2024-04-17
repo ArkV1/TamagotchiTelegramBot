@@ -1,0 +1,647 @@
+# Code from games.py
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from db.db import get_character, update_character_stat
+
+from features.common import calculate_time_left
+from data.games import pc_games, playstation_games
+
+
+async def show_games(update: Update, context: ContextTypes.DEFAULT_TYPE, platform, edit=False):
+    query = update.callback_query
+    await query.answer()
+
+    if(platform == "pc"):
+        games = pc_games
+        text = "Выберите игру на ПК:"
+    elif(platform == "console"):
+        games = playstation_games
+        text = "Выберите игру на Playstation:"
+
+    user_id = query.from_user.id
+    games = pc_games if platform == "pc" else playstation_games
+    buttons = [
+        [InlineKeyboardButton(game["name"], callback_data=f"game_action:{platform}:{game['name']}:{user_id}")]
+        for game in games
+    ]
+    buttons.append([InlineKeyboardButton("Назад", callback_data=f"game_action:{platform}:back:{user_id}")])
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await query.edit_message_text(text=text, reply_markup=reply_markup)
+
+async def game_action_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from features.actions import show_home_options  # Assuming this is where show_home_options is defined
+
+    query = update.callback_query
+    await query.answer()
+
+    # Extracting the game action data
+    _, platform, action_detail, user_id_str = query.data.split(':')
+    user_id = int(user_id_str)
+
+    buttons = [[InlineKeyboardButton("Понял, принял", callback_data=f"profile_action:delete:{user_id}")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    # Authorization check
+    if user_id != query.from_user.id:
+        user_mention = query.from_user.mention_html()
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"{user_mention}, вы не можете выполнить это действие.", 
+                                       parse_mode='HTML', reply_markup=reply_markup)
+        return
+
+    if action_detail == "show_games":
+        await show_games(update, context, platform, True)
+        return
+
+    if action_detail == "back":
+        await show_home_options(update, context, True)
+        return
+
+    character = get_character(user_id)
+
+    now = datetime.now()
+    last_game_played = character.get('last_game_played', datetime.min)
+    cooldown_period = timedelta(hours=2)
+    cooldown_end_time = last_game_played + cooldown_period
+
+    if now < cooldown_end_time:
+        time_left_str = calculate_time_left(cooldown_end_time)
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"Вы недавно уже играли и устали. Подождите еще {time_left_str}.",
+                                       parse_mode='HTML', reply_markup=reply_markup)
+        return
+
+    games = pc_games if platform == "pc" else playstation_games
+    game_or_option_id = action_detail
+
+    # Determine if this is a game selection or option selection
+    game = next((g for g in games if g['name'] == game_or_option_id), None)
+
+    if game:
+        # Game without options logic
+        if "options" not in game:
+            mood_effect = game["mood_effect"]() if callable(game["mood_effect"]) else game["mood_effect"]
+            update_character_stat(user_id, {"$set": {"last_game_played": now}, "$inc": {"mood": mood_effect}})
+            await context.bot.send_message(chat_id=query.message.chat_id,
+                                           text=f"Вы поиграли в {game['name']}. Изменение настроения: {mood_effect}.",
+                                           parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            # If the game has options, prepare to show them
+            buttons = [
+                [InlineKeyboardButton(option["name"], callback_data=f"game_action:{platform}:{option['id']}:{user_id}")]
+                for option in game["options"]
+            ]
+            buttons.append([InlineKeyboardButton("Назад", callback_data=f"game_action:{platform}:show_games:{user_id}")])
+            reply_markup = InlineKeyboardMarkup(buttons)
+            await query.edit_message_text(text="Выберите опцию:", reply_markup=reply_markup)
+    else:
+        # Option selection logic
+        for game in games:
+            option = next((opt for opt in game.get('options', []) if opt['id'] == game_or_option_id), None)
+            if option:
+                mood_effect = option["mood_effect"]() if callable(option["mood_effect"]) else option["mood_effect"]
+                update_character_stat(user_id, {"$set": {"last_game_played": now}, "$inc": {"mood": mood_effect}})
+                await context.bot.send_message(chat_id=query.message.chat_id,
+                                               text=f"Вы выбрали опцию '{option['name']}' в игре '{game['name']}'. Изменение настроения: {mood_effect}.",
+                                               parse_mode='HTML', reply_markup=reply_markup)
+                break
+
+
+# Code from actions.py
+from datetime import datetime, timedelta
+import random
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from db.db import get_character, update_character_stat
+
+from features.games import show_games
+from features.common import calculate_time_left
+from data.activities import home_actions, activities
+
+async def show_home_options(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    buttons = [
+        [InlineKeyboardButton("Подробная инфа", callback_data=f"home_action:details:{user_id}")]
+    ]
+    buttons.extend([
+        [InlineKeyboardButton(action['name'], callback_data=f"home_action:{action['id']}:{user_id}")]
+        for action in home_actions
+    ])
+    buttons.append([InlineKeyboardButton("Закрыть", callback_data=f"profile_action:delete:{user_id}")])
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    if edit:
+        await query.edit_message_text(text="Домашние занятия:", reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(chat_id=query.message.chat_id, text="Домашние занятия:", reply_markup=reply_markup)
+
+async def show_home_action_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # Start constructing the message
+    details_message = "Подробная информация по домашним занятиям:\n\n"
+
+    # Append details for each home action including effects on stats
+    for action in home_actions:
+        cooldown_hours = action['cooldown'].seconds // 3600  # Calculate cooldown in hours
+        details_message += f"{action['name']}: {action['description']}\n"
+
+        # Conditionally add hunger and mood effects if they are not None
+        if action['hunger'] is not None and action['mood'] is not None:
+            details_message += "- Статы: "
+            if action['hunger'] is not None:
+                hunger_effect = f"Голод: {'+' if action['hunger'] > 0 else ''}{action['hunger']}"
+                details_message += f"{hunger_effect}"
+            if action['mood'] is not None:
+                if action['hunger'] is not None:
+                    details_message += ", "
+                mood_effect = f"Настроение: {'+' if action['mood'] > 0 else ''}{action['mood']}"
+                details_message += f"{mood_effect}"
+            details_message += "\n"
+
+        # Additional details specific to actions like 'sleep'
+        if action['id'] == 'sleep':
+            additional_info = "Восстанавливает настроение до нейтрального, если оно было ниже нуля."
+            details_message += f"Дополнительно: {additional_info}\n"
+        
+        details_message += f"- Перезарядка: {cooldown_hours} часов\n\n"
+
+    # Define the button for going back
+    buttons = [[InlineKeyboardButton("Назад", callback_data=f"home_action:back:{user_id}")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    # Update or send the message with the detailed home actions
+    await query.edit_message_text(text=details_message.strip(), reply_markup=reply_markup)
+
+async def home_action_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, action_id, user_id_str = query.data.split(':')
+    user_id = int(user_id_str)
+
+    buttons = [[InlineKeyboardButton("Понял, принял", callback_data=f"profile_action:delete:{user_id}")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    if user_id != query.from_user.id:
+        user_mention = query.from_user.mention_html()
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"{user_mention}, вы не можете выполнить это действие.", 
+                                       parse_mode='HTML', reply_markup=reply_markup)
+        return
+
+    if action_id == "details":
+        # Call the function to show detailed information about home actions
+        await show_home_action_details(update, context)
+        return
+    
+    if action_id == "back":
+        await show_home_options(update, context, True)
+        return
+
+    # Specific actions for gaming platforms
+    if action_id in ["gaming_pc", "gaming_console"]:
+        platform = "pc" if action_id == "gaming_pc" else "console"
+        await show_games(update, context, platform)
+        return
+
+    character = get_character(user_id)
+    current_time = datetime.now()
+
+    action = next((act for act in home_actions if act['id'] == action_id), None)
+    if not action:
+        await context.bot.send_message(chat_id=query.message.chat_id, text="Данное домашнее действие не найдено.", reply_markup=reply_markup)
+        return
+
+    last_action_time = character.get(f"last_{action_id}", datetime.min)
+    cooldown_end_time = last_action_time + action['cooldown']
+    time_left_str = calculate_time_left(cooldown_end_time)
+
+    if current_time < cooldown_end_time:
+        # Custom cooldown messages for specific actions
+        if action_id == "sleep":
+            cooldown_message = f"Вы недавно уже спали, опять поспать можно будет через: {time_left_str}."
+        elif action_id == "eat_free":
+            cooldown_message = f"Вы недавно уже ели, опять похавать можно будет через: {time_left_str}."
+        else:
+            cooldown_message = f"Это действие находится на перезарядке. {time_left_str}."
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=cooldown_message,
+                                       parse_mode='HTML', reply_markup=reply_markup)
+        return
+
+    update_fields = {"$set": {f"last_{action_id}": current_time}}
+
+    if action_id == "sleep":
+        if character.get('mood', 0) < 0:
+            update_fields["$set"]["mood"] = 0
+            response_text = "Вы хорошо выспались и ваше настроение стало нейтральным."
+        else:
+            update_fields["$inc"] = {"mood": 15}
+            response_text = "Вы хорошо выспались и чувствуете себя отдохнувшим."
+        update_fields["$inc"] = {"hunger": action['hunger'], "exp": 5}
+    elif action_id == "eat_free":
+        update_fields["$inc"] = {"hunger": action['hunger'], "mood": action['mood'], "exp": 5}  # Assuming exp increase for action
+        response_text = "Вы бесплатно поели дома. Сытость увеличена."
+    else:
+        update_fields["$inc"] = {
+            "hunger": action['hunger'],
+            "mood": action['mood'],
+            "exp": 5  # Assuming exp increase for all actions, adjust if necessary
+        }
+        response_text = f"Вы успешно выполнили действие '{action['name']}'."
+
+    update_character_stat(user_id, update_fields)
+    await context.bot.send_message(chat_id=query.message.chat_id, text=response_text, parse_mode='HTML', reply_markup=reply_markup)
+
+# async def home_action_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query
+#     await query.answer()
+
+#     _, action, user_id_str = query.data.split(':')
+#     user_id = int(user_id_str)
+
+#     buttons = [[InlineKeyboardButton("Понял, принял", callback_data=f"profile_action:delete:{user_id}")]]
+#     reply_markup = InlineKeyboardMarkup(buttons)
+
+#     if user_id != query.from_user.id:
+#         user_mention = query.from_user.mention_html()
+#         await context.bot.send_message(chat_id=query.message.chat_id, 
+#                                        text=f"{user_mention}, вы не можете выполнить это действие.", 
+#                                        parse_mode='HTML', reply_markup=reply_markup)
+#         return
+
+#     character = get_character(user_id)
+#     current_time = datetime.now()
+
+#     if action == "details":
+#         await show_home_action_details(update, context)
+#         return
+
+#     if action == "gaming_pc" or action == "gaming_console":
+#         platform = "pc" if action == "gaming_pc" else "console"
+#         await show_games(update, context, platform)
+#         return
+
+#     cooldowns = {
+#         "eat_free": timedelta(hours=4),
+#         "sleep": timedelta(hours=8),
+#     }
+
+#     last_action_time = character.get(f"last_{action}", datetime.min)
+#     cooldown_end_time = last_action_time + cooldowns[action]
+#     time_left_str = calculate_time_left(cooldown_end_time)
+
+#     if current_time < cooldown_end_time:
+#         await context.bot.send_message(chat_id=query.message.chat_id, 
+#                                        text=f"Это действие находится на перезарядке. {time_left_str}.",
+#                                        parse_mode='HTML', reply_markup=reply_markup)
+#         return
+
+#     update_fields = {"$set": {}}
+#     update_fields["$set"][f"last_{action}"] = current_time
+#     if action == "eat_free":
+#         update_fields["$inc"] = {"hunger": 20, "exp": 5}
+#         response_text = "Вы бесплатно поели дома. Сытость увеличена."
+#     elif action == "sleep":
+#         if character.get('mood', 0) < 0:
+#             update_fields["$set"]["mood"] = 0
+#             response_text = "Вы хорошо выспались и ваше настроение стало нейтральным."
+#         else:
+#             update_fields["$inc"] = {"hunger": -10, "mood": 15, "exp": 5}
+#             response_text = "Вы хорошо выспались и чувствуете себя отдохнувшим."
+#     update_character_stat(user_id, update_fields)
+
+#     await context.bot.send_message(chat_id=query.message.chat_id, text=response_text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def show_activities_options(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+
+    buttons = [[InlineKeyboardButton("Подробная инфа", callback_data=f"activities_action:details:{user_id}")]]
+    buttons.extend([
+        [InlineKeyboardButton(f"{activity['name']} - {activity['price']}₪", callback_data=f"activities_action:{activity['id']}:{user_id}")]
+        for activity in activities
+    ])
+    buttons.append([InlineKeyboardButton("Закрыть", callback_data=f"profile_action:delete:{user_id}")])
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    if edit:
+        await query.edit_message_text(text="Выберите активность:", reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(chat_id=query.message.chat_id, text="Выберите активность:", reply_markup=reply_markup)
+
+async def show_activity_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    detailed_activities_msg = "Подробная информация о активностях:\n\n"
+    for activity in activities:
+        detailed_activities_msg += (
+            f"{activity['name']}:\n"
+            f"- Требования: Цена: {activity['price']}₪, cытость: -{activity['hunger']}\n"
+            f"- Настроение: +{activity.get('mood', 'N/A')}\n"
+        )
+        if 'chance_of_bad_trip' in activity:
+            detailed_activities_msg += (
+                f"Шанс на бед трип: {activity['chance_of_bad_trip']}%\n(Настроение при бед трипе: {activity['bad_trip_mood']})\n"
+            )
+        detailed_activities_msg += "\n"
+
+    buttons = [[InlineKeyboardButton("Назад", callback_data=f"activities_action:back:{user_id}")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await query.edit_message_text(text=detailed_activities_msg, reply_markup=reply_markup)
+
+
+######################################################################################################################
+
+async def activities_action_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, activity_id, user_id_str = query.data.split(':')
+    user_id = int(user_id_str)
+
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Понял, принял", callback_data=f"profile_action:delete:{user_id}")]])
+
+    if query.from_user.id != user_id:
+        user_mention = query.from_user.mention_html()
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"{user_mention}, вы не можете выполнить это действие.", 
+                                       parse_mode='HTML', reply_markup=reply_markup)
+        return
+
+    if activity_id == "back":
+        await show_activities_options(update, context, True)
+        return
+
+    if activity_id == "details":
+        await show_activity_details(update, context)
+        return
+
+    character = get_character(user_id)
+    activity = next((act for act in activities if act['id'] == activity_id), None)
+    if not activity:
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text="Активность не найдена.", 
+                                       reply_markup=reply_markup)
+        return
+
+    now = datetime.now()
+    if 'last_activity_time' in character and now < character['last_activity_time'] + timedelta(hours=2):
+        time_left_str = calculate_time_left(character['last_activity_time'] + timedelta(hours=2))
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"Вы недавно выполнили другую активность. Подождите еще {time_left_str}.", 
+                                       reply_markup=reply_markup)
+        return
+
+    if character.get('money', 0) < activity['price']:
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=f"У вас не хватает денег. Требуется: {activity['price']}₪.",
+                                       reply_markup=reply_markup)
+        return
+
+    if character.get('hunger', 100) < activity['hunger']:
+        hunger_response = {
+            "walk_girl": "Перед прогулкой с тян стоило бы поесть.",
+            "walk_boys": "Перед прогулкой с друзьями стоило бы поесть.",
+            "smoke": "Перед курением стоило бы поесть.",
+            "rave": "Перед рейвом стоило бы поесть."
+        }
+        await context.bot.send_message(chat_id=query.message.chat_id, 
+                                       text=hunger_response[activity_id],
+                                       reply_markup=reply_markup)
+        return
+
+    update_fields = {
+        "$inc": {
+            "money": -activity['price'],
+            "hunger": -activity['hunger'],
+            "exp": 5
+        },
+        "$set": {
+            "last_activity_time": now
+        }
+    }
+
+    if activity_id == "smoke" and random.randint(1, 100) <= activity.get('chance_of_bad_trip', 0):
+        update_fields["$inc"]["mood"] = activity['bad_trip_mood']
+        response_text = "Вы словили бет трип. Настроение ухудшилось."
+    else:
+        update_fields["$inc"]["mood"] = activity['mood']
+        response_texts = {
+            "smoke": "Вы пиздато дунули. Настроение улучшилось.",
+            "rave": "Рейв был пиздатым. Настроение значительно улучшилось.",
+            "walk_girl": "Прогулка была приятной. Настроение улучшилось.",
+            "walk_boys": "Вы хорошо провели время с друзьями. Настроение улучшилось."
+        }
+        response_text = response_texts[activity_id]
+
+    update_character_stat(user_id, update_fields)
+    await context.bot.send_message(chat_id=query.message.chat_id, text=response_text, reply_markup=reply_markup)
+
+
+# Code from games.py
+import random
+
+pc_games = [
+    {
+        "name": "Тарков",
+        "options": [
+            {
+                "id": "inv",
+                "name": "Разложить инвентарь",
+                "duration": 600,  # 10 hours in minutes
+                "mood_effect": 5,
+            },
+            {
+                "id": "play",
+                "name": "Рейд",
+                "duration": 120, 
+                "mood_effect": lambda: random.randint(-20, 20), # Random mood effect
+                "death_chance": 0.15,  # 15% chance of death
+                "death_mood_effect": -50
+            },
+        ],
+    },
+    {"name": "Хелдайверс 2", "duration": 120, "mood_effect": 15},
+    {"name": "Литал компани", "duration": 120, "mood_effect": 10},
+    {"name": "Маинкрафт", "duration": 120, "mood_effect": 8},
+]
+
+playstation_games = [
+    {"name": "UFC", "duration": 60, "mood_effect": 12},
+    {"name": "Fall guys", "duration": 60, "mood_effect": 18},
+]
+
+# Code from common.py
+from datetime import datetime
+
+def calculate_level_from_exp(exp_points):
+        # Experience requirements as defined for levels 2 to 10, and fixed afterwards.
+        exp_requirements = [0, 25, 50, 100, 150, 250, 375, 500, 750, 1000]
+        level = 1  # Start from level 1
+
+        # Correcting the logic to avoid incrementing the level for 0 XP.
+        for i, requirement in enumerate(exp_requirements[1:], start=2):  # Start enumeration at 2 for level 2
+            if exp_points >= requirement:
+                level = i
+            else:
+                break  # Stop if the experience points are less than the requirement for the next level.
+        
+        # For experience points above the highest defined threshold, calculate the level with fixed 1000 XP increments.
+        if exp_points >= exp_requirements[-1]:
+            additional_levels = (exp_points - exp_requirements[-1]) // 1000
+            # Ensure level calculation starts correctly from the level corresponding to the last specific requirement.
+            level = len(exp_requirements) + additional_levels
+        
+        return level
+
+def calculate_time_left(job_end_time):
+    current_time = datetime.now()
+    if current_time < job_end_time:
+        time_left = job_end_time - current_time
+        hours, remainder = divmod(time_left.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        time_str_parts = []
+
+        # Adding hours to the string if greater than 0
+        if hours > 0:
+            if hours % 10 == 1 and hours != 11:
+                time_str_parts.append(f"{hours} час")
+            elif 2 <= hours % 10 <= 4 and (hours < 10 or hours > 20):
+                time_str_parts.append(f"{hours} часа")
+            else:
+                time_str_parts.append(f"{hours} часов")
+
+        # Adding minutes to the string if there are any minutes
+        if minutes > 0:
+            if minutes % 10 == 1 and minutes != 11:
+                time_str_parts.append(f"{minutes} минута")
+            elif 2 <= minutes % 10 <= 4 and (minutes < 10 or minutes > 20):
+                time_str_parts.append(f"{minutes} минуты")
+            else:
+                time_str_parts.append(f"{minutes} минут")
+
+        # Adding seconds to the string if there are no hours and no minutes
+        if hours == 0 and minutes == 0:
+            if seconds % 10 == 1 and seconds != 11:
+                time_str_parts.append(f"{seconds} секунда")
+            elif 2 <= seconds % 10 <= 4 and (seconds < 10 or seconds > 20):
+                time_str_parts.append(f"{seconds} секунды")
+            else:
+                time_str_parts.append(f"{seconds} секунд")
+
+        # Joining the parts of the string considering the presence of hours, minutes, and seconds
+        return ', '.join(time_str_parts)
+    else:
+        return None
+
+# Code from db.py
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
+from pymongo.collection import ReturnDocument
+
+
+###########################################################################################
+###                                      DATABASE                                       ###
+###########################################################################################
+
+def initialize_database():
+    try:
+        # Connection URI
+        uri = 'mongodb://localhost:27017/'
+        # Create a MongoClient to the running mongod instance
+        client = MongoClient(uri)
+        
+        # The ismaster command is cheap and does not require auth.
+        client.admin.command('ismaster')
+        
+        # Specify the database name to use or create if it doesn't exist
+        db = client['MyPetTroyan']
+        pets_collection = db['troyans']
+        
+        print("Database initialized successfully.")
+        return pets_collection
+    except ConnectionFailure as e:
+        print(f"Could not connect to MongoDB: {e}")
+        return None
+    
+
+###########################################################################################
+
+# Attempt to initialize the database
+pets_collection = initialize_database()
+
+# Exit if database initialization fails
+if pets_collection is None:
+    print("Database initialization failed. Exiting...")
+    exit(1)
+
+###########################################################################################
+
+def create_character(unique_id, name):
+    print(f"Creating character with unique_id: {unique_id} and name: {name}")
+    default_character = {
+        "unique_id": unique_id,
+        "name": name,  # Use the variable directly without quotes or braces
+        "exp": 0,
+        "hunger": 0,
+        "health": 100,
+        "money": 0,
+        "mood": 25,
+    }
+    pets_collection.replace_one({"unique_id": unique_id}, default_character, upsert=True)
+    return
+
+
+def update_character_stat(unique_id, update_operations):
+    """
+    Update a character's statistics, with debugging prints for the document
+    before and after the update.
+
+    Parameters:
+    - unique_id (str): The unique identifier for the character.
+    - update_operations (dict): MongoDB update operations dict.
+
+    Returns:
+    - The updated document or None if the update was unsuccessful.
+    """
+    try:
+        # Print the document before the update
+        current_document = pets_collection.find_one({"unique_id": unique_id})
+        print("\nBefore update:", current_document)
+
+        updated_document = pets_collection.find_one_and_update(
+            {"unique_id": unique_id},
+            update_operations,
+            return_document=ReturnDocument.AFTER
+        )
+
+        # Print the document after the update
+        print("\nAfter update:", updated_document)
+
+        return updated_document
+    except Exception as e:
+        print(f"An error occurred while updating character stats: {e}")
+        return None
+
+
+def get_character(unique_id):
+    return pets_collection.find_one({"unique_id": unique_id})
+
+###########################################################################################
